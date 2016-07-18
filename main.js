@@ -1,2 +1,0 @@
-var proxy = require("./proxy");
-
