@@ -1,18 +1,23 @@
 // flv is big-endian
 
 var fs = require('fs');
+var inherits = require("util").inherits;
+
 var filename = "test.flv";
 var buffer = new Buffer(65536);
 var FLV_HEADER_LENGTH = 9;
+var FLV_TAG_HEADER_LENGTH = 11;
 var FLV_PREVIOUS_TAG_SIZE_LENGTH = 4;
 
-fs.open(filename, "r", function(err, fd) {
-	if (err) {
-		console.error("open " + filename + "failed. ", err);
-		return;
-	}
-	read_flv(fd)
-})
+var old_main = function() {
+	fs.open(filename, "r", function(err, fd) {
+		if (err) {
+			console.error("open " + filename + "failed. ", err);
+			return;
+		}
+		read_flv(fd)
+	});
+};
 
 var read_flv_header = function(fd, callback) {
 	if (typeof callback !== "function") {
@@ -46,6 +51,7 @@ var FlvParser = (function() {
 
 	var FlvParser = function(opts, on_complete) {
 		this.file_name = opts.file_name;
+		this.start_time = opts.start_time;
 		this.current_tag_position = 0;
 		this.fd = fs.openSync(this.file_name, "r");
 		this.buffer = new Buffer(DEFAULT_BUFFER_SIZE);
@@ -78,20 +84,20 @@ var FlvParser = (function() {
 	// ---------- private ----------
 	var parse_flv_initial_part_sync_ = function(on_complete) {
 		var self = this;
-		fs.read(fd, this.buffer, 0, this.buffer.length, 0, function(err, bytes_read, buff) {
+		fs.read(this.fd, this.buffer, 0, this.buffer.length, 0, function(err, bytes_read, buff) {
 			if (err) {
 				on_complete(err);
 				return;
 			}
 			read_flv_header_.call(self);
 			read_flv_previous_tag_size_.call(self);
-			var first_tag = new FlvTag(buff, self.current_file_position);
+			var first_tag = new FlvTag(buff, self.current_file_position, false);
 			self.current_file_position += first_tag.buffer.length;
-			var second_tag = new FlvTag(buff, self.current_file_position);
+			var second_tag = new FlvTag(buff, self.current_file_position, false);
 			self.current_file_position += second_tag.buffer.length;
-			var third_tag = new FlvTag(buff, self.current_file_position);
+			var third_tag = new FlvTag(buff, self.current_file_position, false);
 			self.current_file_position += third_tag.buffer.length;
-			self.initial_tags = [first_tag, second_tag, third_tag];
+			self.initial_tags = [buff.slice(0, FLV_HEADER_LENGTH + FLV_PREVIOUS_TAG_SIZE_LENGTH), first_tag.buffer, second_tag.buffer, third_tag.buffer];
 			on_complete();
 		});
 	}
@@ -105,8 +111,12 @@ var FlvParser = (function() {
 	}
 	
 	// ---------- public ----------
+	p.get_fixed_initial_buffer = function() {
+		return Buffer.concat(this.initial_tags);
+	};
+
 	p.create_read_stream = function() {
-		var ret = new FlvStreamer(this);
+		return new FlvStreamer(this);
 	};
 	
 	/**
@@ -115,6 +125,7 @@ var FlvParser = (function() {
 	p.seek_to_time = function(time) {
 		var key_frame_info = this.find_key_frame_info_by_time(time);
 		this.current_file_position = key_frame_info.position;
+		return key_frame_info.time;
 	};
 	
 	/**
@@ -122,60 +133,96 @@ var FlvParser = (function() {
 	 * @param {number} time in millisecond
 	 */
 	p.find_key_frame_info_by_time = function(time) {
-		if (!Array.isArray(this.key_frames) || key_frames.length === 0) {
+		if (!Array.isArray(this.key_frames) || this.key_frames.length === 0) {
 			throw "Need this.key_frames array when calling FlvParser::find_key_frame_by_time().";
 		}
-		this.key_frames.reduce(function (prev, curr) {
+		return this.key_frames.reduce(function (prev, curr) {
 			return (Math.abs(curr.time - time) < Math.abs(prev.time - time) ? curr : prev);
 		});
 	}
+	
+	var FlvStreamer = (function() {
+		// ---------- private ----------
+		var STATE = {
+			_WAITING_HEADER_END : 0,
+			_WAITING_BODY_END : 1
+		};
+		var state = STATE._WAITING_HEADER_END;
+		var body_bytes_to_read = 0;
+
+		var header_buffer;
+		var allocate_header_buffer = function() {
+			header_buffer = Buffer.allocUnsafe(FLV_TAG_HEADER_LENGTH);
+			header_buffer.position = 0;
+		};
+
+		// ---------- public ----------
+		var FlvStreamer = function(flv_parser) {
+			this.flv_parser = flv_parser;
+			Transform.call(this, {});
+			this.init();
+		};
+
+		var Transform = require("stream").Transform;
+		inherits(FlvStreamer, Transform);
+
+		var p = FlvStreamer.prototype;
+		
+		p.init = function() {
+			var self = this;
+			allocate_header_buffer();
+			var flv_parser = this.flv_parser;
+
+			this.push(flv_parser.get_fixed_initial_buffer());
+
+			this.exact_start_time_stamp = flv_parser.seek_to_time(flv_parser.start_time);
+			this.raw_read_stream = fs.createReadStream("", {
+				flags: "r",
+				fd: flv_parser.fd,
+				start: flv_parser.current_file_position
+			});
+			this.raw_read_stream.pipe(this);
+		};
+
+		p._transform = function(chunk, encoding, next) {
+			do {
+				if (state === STATE._WAITING_HEADER_END) {
+					if (chunk.length + header_buffer.position < FLV_TAG_HEADER_LENGTH) {
+						chunk.copy(header_buffer, header_buffer.position);
+						break;
+					}
+					chunk.copy(header_buffer, header_buffer.position);
+					chunk = chunk.slice(FLV_TAG_HEADER_LENGTH - header_buffer.position);
+					var raw_time_stamp = read_uint24_be(header_buffer, 4);
+					body_bytes_to_read = read_uint24_be(header_buffer, 1) + FLV_PREVIOUS_TAG_SIZE_LENGTH;
+					state = STATE._WAITING_BODY_END;
+					write_uint24_be(header_buffer, 4, raw_time_stamp - this.exact_start_time_stamp);
+					debugger;
+					this.push(header_buffer);
+					allocate_header_buffer();
+				} else if (state === STATE._WAITING_BODY_END) {
+					if (chunk.length < body_bytes_to_read) {
+						this.push(chunk);
+						body_bytes_to_read -= chunk.length;
+						break;
+					} else {
+						this.push(chunk.slice(0, body_bytes_to_read));
+						chunk = chunk.slice(body_bytes_to_read);
+						body_bytes_to_read = 0;
+						state = STATE._WAITING_HEADER_END;
+					}
+				}
+			} while (chunk.length > 0);
+			next();
+		};
+		
+		return FlvStreamer;
+	}());
 
 	return FlvParser;
 }());
 
-var FlvStreamer = (function() {
-
-	var FlvStreamer = function(flv_parser) {
-		this.flv_parser = flv_parser;
-		Readable.call(this, {});
-	};
-
-	inherits(FlvStreamer, Readable);
-
-	var p = FlvStreamer.prototype;
-
-	p.init = function() {
-		var self = this;
-		
-		// this.push(this.flv_parser.get_header_buffer());
-		// this.push(this.flv_parser.get_first_previous_tag_size_buffer());
-		// this.push(this.flv_parser.get_init_config_tags_buffer());
-		var flv_parser = this.flv_parser;
-		this.push(flv_parser.get_fixed_initial_buffer());
-
-		flv_parser.seek_to(this.start_time, function(exact_start_time) {
-			var flv_tag_stream = flv_parser.create_flv_tag_stream();
-			flv_tag_stream.on("flv_tag", function(tag) {
-				tag.time_stamp -= exact_start_time;
-				self.push(tag.buffer);
-			});
-			flv_tag_stream.on("end", function() {
-				// TODO
-				// self.exit();
-			});
-			flv_tag_stream.start();
-		});
-	}
-
-	p._read = function(size) {
-	};
-	
-	return FlvStreamer;
-}());
-
 var FlvTag = (function() {
-
-	var FLV_TAG_HEADER_LENGTH = 11;
 
 	var FlvTag = function(buffer, position) {
 		if (buffer && typeof position !== "undefined") {
@@ -183,7 +230,7 @@ var FlvTag = (function() {
 		}
 	};
 
-	FlvTag.prototype.read = function(buffer, position) {
+	FlvTag.prototype.read = function(buffer, position, read_detail) {
 		if (!this.buffer) {
 			this.buffer = new Buffer(FLV_TAG_HEADER_LENGTH);
 		}
@@ -196,8 +243,10 @@ var FlvTag = (function() {
 		}
 		this.tag_type = first_byte & 0x1f;
 		this.data_size = read_uint24_be(header_buffer, 1);
-		this.buffer = new Buffer(FLV_TAG_HEADER_LENGTH + this.data_size);
-		this.header_buffer.copy(this.buffer);
+		this.buffer = buffer.slice(position, position + FLV_TAG_HEADER_LENGTH + this.data_size + FLV_PREVIOUS_TAG_SIZE_LENGTH);
+		if (!read_detail) {
+			return;
+		}
 		this.time_stamp = read_uint24_be(header_buffer, 4) & (header_buffer.readUInt8(7) << 24);
 		var tag_position = position + FLV_TAG_HEADER_LENGTH;
 		var on_complete = function(err, data, bytes_read) {
@@ -209,14 +258,14 @@ var FlvTag = (function() {
 			// console.log(JSON.stringify(ret));
 			callback(null, self, total_bytes_read);
 		};
-		switch (self.tag_type) {
+		switch (this.tag_type) {
 			case 8:		// audio
 				return;
 				read_flv_audio_tag(fd, tag_position, on_complete);
 				break;
 			case 9:		// video
-				self.data = new FlvVideoTag(self.data_size);
-				self.data.read(fd, tag_position, on_complete);
+				this.data = new FlvVideoTag(this.data_size);
+				this.data.read(fd, tag_position, on_complete);
 				break;
 			case 18:	// metadata
 				read_flv_script_data(fd, tag_position, on_complete);
@@ -595,6 +644,12 @@ var read_uint24_be = function(buffer, position) {
 	return ret;
 };
 
+var write_uint24_be = function(buffer, position, value) {
+	buffer[position] = value >> 16;
+	buffer[position + 1] = (value >> 8) & 0xff;
+	buffer[position + 2] = (value & 0xff);
+}
+
 var read_int24_be = function(buffer, position) {
 	var value = read_uint24_be(buffer, position);
 	var is_negative = value & 0x800000;
@@ -636,3 +691,22 @@ var read_flv = function(fd) {
 	};
 	_read_flv_header();
 };
+
+var main = function() {
+	var parser = new FlvParser({
+		file_name: "test.flv",
+		start_time: 3000
+	}, function(err) {
+		if (err) {
+			console.error(err);
+			return;
+		}
+		var read_stream = parser.create_read_stream();
+		var write_stream = fs.createWriteStream("3.flv");
+		read_stream.pipe(write_stream);
+		read_stream.on("end", function() {
+			console.log("Done.");
+		});
+	});
+};
+main();
